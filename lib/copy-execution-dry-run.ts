@@ -65,6 +65,7 @@ export function buildCopyExecutionDryRun(args: {
 
   return {
     mode: "dry_run" as const,
+    preflight: true as const,
     stateSource: "supplied_snapshot" as const,
     policyEligible,
     reason: !decision.allowed ? decision.reason : !previewGate.allowed ? previewGate.reason : null,

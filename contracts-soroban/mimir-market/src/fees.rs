@@ -1,10 +1,13 @@
 //! Payout arithmetic. The mirror of this lives in `lib/fees.ts`.
 
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Env, Symbol, Vec};
 
 use crate::events;
 use crate::storage;
-use crate::types::{Error, FeeSnapshot, BPS_DIVISOR};
+use crate::types::{
+    Error, FeePolicyCompatibility, FeeRoundingMode, FeeSnapshot, BPS_DIVISOR,
+    FEE_POLICY_COMPAT_VERSION, FEE_TIMELOCK_SECONDS, MAX_TOTAL_FEE_BPS, MIN_STAKE, USDC_DECIMALS,
+};
 
 /// Exact fee-ledger view for one recipient, in atomic USDC units.
 ///
@@ -24,6 +27,16 @@ pub struct FeeBalance {
 /// `stake * bps / BPS_DIVISOR`, truncating. Checked multiplication so an
 /// absurd stake errors instead of wrapping, matching Solidity 0.8 revert-on-
 /// overflow semantics.
+/// Returns `Error::StaleFeePolicyRevision` when an approved administrative
+/// change is stale relative to the active fee-policy revision.
+/// Callers must reject such changes and leave the active policy and balances untouched.
+pub fn check_policy_revision(expected: u64, active: u64) -> Result<(), Error> {
+    if expected != active {
+        return Err(Error::StaleFeePolicyRevision);
+    }
+    Ok(())
+}
+
 pub fn gross_payout(stake: i128, bps: u32) -> Result<i128, Error> {
     stake
         .checked_mul(bps as i128)
@@ -94,6 +107,57 @@ fn bps_of(amount: i128, bps: u32) -> Result<i128, Error> {
         .ok_or(Error::Overflow)
 }
 
+#[cfg(test)]
+mod settlement_vector_tests {
+    //! Independently derived expected values for tiny atomic USDC stakes.
+    //! Expectations are computed by hand (integer floor division), not by
+    //! calling the contract's own helpers, so they cross-check the logic.
+    use super::*;
+
+    #[test]
+    fn pool_share_splits_with_indivisible_remainder() {
+        // Three challengers stake 1, 1, 1 (total 3) against a creator stake of 2.
+        // Each owes floor(1 * 2 / 3) = 0, so the whole pool remains as dust.
+        assert_eq!(pool_share(1, 2, 3).unwrap(), 0);
+        assert_eq!(pool_share(1, 2, 3).unwrap() + pool_share(1, 2, 3).unwrap() + pool_share(1, 2, 3).unwrap(), 0);
+        // Stakes 2, 3, 5 (total 10) against creator stake 7:
+        // floor(2*7/10)=1, floor(3*7/10)=2, floor(5*7/10)=3 -> sum 6, dust 1.
+        assert_eq!(pool_share(2, 7, 10).unwrap(), 1);
+        assert_eq!(pool_share(3, 7, 10).unwrap(), 2);
+        assert_eq!(pool_share(5, 7, 10).unwrap(), 3);
+    }
+
+    #[test]
+    fn pool_share_zero_total_is_zero() {
+        assert_eq!(pool_share(0, 5, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn pool_share_overflow_errors() {
+        assert_eq!(pool_share(i128::MAX, 2, 1), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn gross_payout_tiny_stakes_round_down() {
+        // 1 atomic unit at 3333 bps: floor(3333 / 10000) = 0.
+        assert_eq!(gross_payout(1, 3333).unwrap(), 0);
+        // 3 atomic units at 5000 bps: floor(15000 / 10000) = 1.
+        assert_eq!(gross_payout(3, 5000).unwrap(), 1);
+    }
+
+    #[test]
+    fn quote_fees_no_profit_takes_nothing() {
+        let fees = FeeSnapshot {
+            platform_fee_bps: 1000,
+            agent_owner_fee_bps: 500,
+            platform_recipient: None,
+            agent_owner_recipient: None,
+        };
+        assert_eq!(quote_fees(10, 10, &fees).unwrap(), (10, 0));
+        assert_eq!(quote_fees(10, 7, &fees).unwrap(), (7, 0));
+    }
+}
+
 /// Split a gross payout into fees and the amount owed.
 ///
 /// Fees apply to PROFIT only, so `owed` can never fall below `principal` for a
@@ -152,48 +216,45 @@ pub fn apply_fees(
     Ok((owed, fees_taken))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Pure-arithmetic boundary checks for the fee ledger view semantics.
-    // The FeeBalance derivation is `outstanding = accrued - claimed`; these
-    // assertions pin the three distinct states the issue requires.
-
-    fn balance(accrued: i128, claimed: i128) -> FeeBalance {
-        FeeBalance {
-            accrued,
-            claimed,
-            outstanding: accrued - claimed,
-        }
+/// Build the bounded fee-policy compatibility descriptor for generated clients.
+///
+/// Pure read over instance storage: performs no auth check, writes no state,
+/// emits no events, and returns `Err(Error::NotInitialized)` before
+/// `initialize` has succeeded.
+pub fn fee_policy_compatibility(env: &Env) -> Result<FeePolicyCompatibility, Error> {
+    if !storage::is_initialized(env) {
+        return Err(Error::NotInitialized);
     }
 
-    #[test]
-    fn no_accrual_is_distinct_from_fully_claimed() {
-        let never = balance(0, 0);
-        let fully_claimed = balance(500, 500);
-        assert_eq!(never.accrued, 0);
-        assert_eq!(never.outstanding, 0);
-        assert_eq!(fully_claimed.accrued, 500);
-        assert_eq!(fully_claimed.outstanding, 0);
-        assert_ne!(never.accrued, fully_claimed.accrued);
-    }
+    let policy = storage::fee_policy(env)?;
+    let has_pending_policy = storage::pending_fee_policy(env).is_some();
 
-    #[test]
-    fn partial_claim_leaves_exact_outstanding() {
-        let partial = balance(1_000_000, 250_000);
-        assert_eq!(partial.outstanding, 750_000);
-    }
+    let mut supported_fields = Vec::new(env);
+    supported_fields.push_back(Symbol::new(env, "platform_fee_bps"));
+    supported_fields.push_back(Symbol::new(env, "agent_owner_fee_bps"));
+    supported_fields.push_back(Symbol::new(env, "platform_recipient"));
+    supported_fields.push_back(Symbol::new(env, "agent_owner_recipient"));
+    supported_fields.push_back(Symbol::new(env, "revision"));
 
-    #[test]
-    fn quote_has_no_fees_at_or_below_principal() {
-        let fees = FeeSnapshot {
-            platform_fee_bps: 100,
-            agent_owner_fee_bps: 50,
-            platform_recipient: None,
-            agent_owner_recipient: None,
-        };
-        assert_eq!(quote_fees(100, 100, &fees).unwrap(), (100, 0));
-        assert_eq!(quote_fees(100, 90, &fees).unwrap(), (90, 0));
-    }
+    let current_total_fee_bps = policy
+        .platform_fee_bps
+        .checked_add(policy.agent_owner_fee_bps)
+        .ok_or(Error::Overflow)?;
+
+    Ok(FeePolicyCompatibility {
+        schema_version: FEE_POLICY_COMPAT_VERSION,
+        supported_fields,
+        max_total_fee_bps: MAX_TOTAL_FEE_BPS,
+        bps_divisor: BPS_DIVISOR,
+        fee_timelock_seconds: FEE_TIMELOCK_SECONDS,
+        usdc_decimals: USDC_DECIMALS,
+        min_stake: MIN_STAKE,
+        rounding_mode: FeeRoundingMode::FloorPerLegParticipantRemainder,
+        profit_only: true,
+        pull_based_payouts: true,
+        exact_usdc_escrow: true,
+        current_revision: policy.revision,
+        current_total_fee_bps,
+        has_pending_policy,
+    })
 }
